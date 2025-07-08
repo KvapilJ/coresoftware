@@ -67,6 +67,11 @@ namespace
   }
 }  // namespace
 
+/*namespace {
+  std::mutex bz_mutex;
+  std::mutex pos_mutex;
+}*/
+
 using keylist = std::vector<TrkrDefs::cluskey>;
 
 PHSimpleKFProp::PHSimpleKFProp(const std::string& name)
@@ -138,6 +143,7 @@ int PHSimpleKFProp::InitRun(PHCompositeNode* topNode)
 
 double PHSimpleKFProp::get_Bz(double x, double y, double z) const
 {
+  //std::lock_guard<std::mutex> lock(bz_mutex); 
   if (_use_const_field || fabs(z) > 105.5)
   {
     return _const_field;
@@ -254,6 +260,41 @@ int PHSimpleKFProp::process_event(PHCompositeNode* topNode)
   }
   std::vector<std::vector<TrkrDefs::cluskey>> new_chains;
   std::vector<TrackSeed_v2> unused_tracks;
+#pragma omp parallel num_threads(2)
+{
+  std::vector<std::vector<TrkrDefs::cluskey>> local_chains;
+  std::vector<TrackSeed_v2> local_unused;
+
+// --- build a thread-local copy of the field map ---
+ PHFieldConfigv1 fcfg_loc;
+ if (!_use_const_field)
+ {
+   fcfg_loc.set_field_config(PHFieldConfig::FieldConfigTypes::Field3DCartesian);
+   fcfg_loc.set_filename(m_magField);
+ }
+ else
+ {
+   fcfg_loc.set_field_config(PHFieldConfig::FieldConfigTypes::kFieldUniform);
+   fcfg_loc.set_magfield_rescale(_const_field);
+ }
+ auto thread_field_map = std::unique_ptr<PHField>(PHFieldUtility::BuildFieldMap(&fcfg_loc));
+
+  //auto thread_field_map = std::make_unique<PHField>(*(_field_map));
+  std::unique_ptr<ALICEKF> fitter_loc = std::make_unique<ALICEKF>(topNode, _cluster_map, thread_field_map.get(), _fieldDir,
+                                     _min_clusters_per_track, _max_sin_phi, Verbosity());
+      fitter_loc->setNeonFraction(Ne_frac);
+      fitter_loc->setArgonFraction(Ar_frac);
+      fitter_loc->setCF4Fraction(CF4_frac);
+      fitter_loc->setNitrogenFraction(N2_frac);
+      fitter_loc->setIsobutaneFraction(isobutane_frac);
+      fitter_loc->useConstBField(_use_const_field);
+      fitter_loc->setConstBField(_const_field);
+      fitter_loc->useFixedClusterError(_use_fixed_clus_err);
+      fitter_loc->setFixedClusterError(0, _fixed_clus_err.at(0));
+      fitter_loc->setFixedClusterError(1, _fixed_clus_err.at(1));
+      fitter_loc->setFixedClusterError(2, _fixed_clus_err.at(2));
+
+  #pragma omp for schedule(static)
   for (size_t track_it = 0; track_it != _track_map->size(); ++track_it)
   {
     if (Verbosity())
@@ -290,25 +331,25 @@ int PHSimpleKFProp::process_event(PHCompositeNode* topNode)
       /// This will by definition return a single pair with each vector
       /// in the pair length 1 corresponding to the seed info
       std::vector<float> trackChi2;
-      timer.stop();
-      timer.restart();
+      //timer.stop();
+      //timer.restart();
 
-      auto seedpair = fitter->ALICEKalmanFilter(keylist_A, false,
+      auto seedpair = fitter_loc->ALICEKalmanFilter(keylist_A, false,
                                                 trackClusPositions, trackChi2);
 
-      timer.stop();
+      //timer.stop();
       if (Verbosity() > 3)
       {
         std::cout << "single track ALICEKF time " << timer.elapsed()
                   << std::endl;
       }
-      timer.restart();
+      //timer.restart();
 
       /// circle fit back to update track parameters
       TrackSeedHelper::circleFitByTaubin(track, trackClusPositions, 7, 55);
       TrackSeedHelper::lineFit(track, trackClusPositions, 7, 55);
       track->set_phi(TrackSeedHelper::get_phi(track, trackClusPositions));
-      timer.stop();
+      //timer.stop();
       if (Verbosity() > 3)
       {
         std::cout << "single track circle fit time " << timer.elapsed() << std::endl;
@@ -323,8 +364,8 @@ int PHSimpleKFProp::process_event(PHCompositeNode* topNode)
         std::cout << "is tpc track" << std::endl;
       }
 
-      timer.stop();
-      timer.restart();
+      //timer.stop();
+      //timer.restart();
 
       if (Verbosity())
       {
@@ -343,7 +384,8 @@ int PHSimpleKFProp::process_event(PHCompositeNode* topNode)
         std::cout << "kl size " << kl.size() << std::endl;
       }
       std::vector<float> pretrackChi2;
-      auto prepair = fitter->ALICEKalmanFilter(kl, false, globalPositions, pretrackChi2);
+      
+      auto prepair = fitter_loc->ALICEKalmanFilter(kl, false, globalPositions, pretrackChi2);
       if (prepair.first.empty() || prepair.second.empty())
       {
         continue;
@@ -369,14 +411,14 @@ int PHSimpleKFProp::process_event(PHCompositeNode* topNode)
 
       if (finalchain.size() > kl.at(0).size())
       {
-        new_chains.push_back(finalchain);
+        local_chains.push_back(finalchain);
       }
       else
       {
-        new_chains.push_back(kl.at(0));
+        local_chains.push_back(kl.at(0));
       }
 
-      timer.stop();
+      //timer.stop();
 
       if (Verbosity() > 3)
       {
@@ -391,9 +433,36 @@ int PHSimpleKFProp::process_event(PHCompositeNode* topNode)
       {
         std::cout << "is NOT tpc track" << std::endl;
       }
-      unused_tracks.emplace_back(*track);
+      local_unused.emplace_back(*track);
     }
   }
+
+    // Critical sections to merge thread-local results
+  #pragma omp critical
+  {
+    new_chains.insert(new_chains.end(), local_chains.begin(), local_chains.end());
+    unused_tracks.insert(unused_tracks.end(), local_unused.begin(), local_unused.end());
+  }
+}
+
+std::cout<<"event"<<std::endl;
+for (size_t i = 0; i < new_chains.size(); ++i)
+{
+  const auto& chain = new_chains[i];
+  std::cout << "Chain " << i << " (size: " << chain.size() << "):" << std::endl;
+
+  /*for (const auto& cluskey : chain)
+  {
+    unsigned int layer = TrkrDefs::getLayer(cluskey);
+    std::cout << "  cluskey: " << cluskey
+              << ", layer: " << layer
+              << std::endl;
+  }*/
+
+  //std::cout << std::endl;
+}
+
+
 
   _track_map->Reset();
   timer.stop();
@@ -438,6 +507,7 @@ int PHSimpleKFProp::process_event(PHCompositeNode* topNode)
 Acts::Vector3 PHSimpleKFProp::getGlobalPosition(TrkrDefs::cluskey key, TrkrCluster* cluster) const
 {
   // get global position from Acts transform
+  //std::lock_guard<std::mutex> lock(pos_mutex);
   return _pp_mode ?
     m_tgeometry->getGlobalPosition(key, cluster):
     m_globalPositionWrapper.getGlobalPositionDistortionCorrected( key, cluster, 0 );
